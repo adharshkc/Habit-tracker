@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { createClient } from '@supabase/supabase-js';
+import { initializeApp } from 'firebase/app';
+import { getFirestore, doc, getDoc, setDoc } from 'firebase/firestore';
 import {
   CheckCircle2,
   Calendar,
@@ -29,21 +30,28 @@ import {
   ArrowDown,
   Cloud,
   CloudOff,
-  LogOut,
   Lightbulb,
   Lock
 } from 'lucide-react';
 
 // ==========================================
-// CLOUD SYNC CONFIG (Supabase)
-// Put these in a .env file in your project root:
-//   VITE_SUPABASE_URL=https://xxxx.supabase.co
-//   VITE_SUPABASE_ANON_KEY=your-anon-key
+// CLOUD SYNC CONFIG (Firebase)
+// Put these in the .env file in your project root (from Firebase → Project settings → Your apps):
+//   VITE_FIREBASE_API_KEY=...
+//   VITE_FIREBASE_AUTH_DOMAIN=your-project.firebaseapp.com
+//   VITE_FIREBASE_PROJECT_ID=your-project
+//   VITE_FIREBASE_APP_ID=1:123:web:abc
 // Without them the app runs fully offline (localStorage only).
 // ==========================================
-const SUPABASE_URL = import.meta.env?.VITE_SUPABASE_URL || '';
-const SUPABASE_KEY = import.meta.env?.VITE_SUPABASE_ANON_KEY || '';
-const supabase = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+const firebaseConfig = {
+  apiKey: import.meta.env?.VITE_FIREBASE_API_KEY || '',
+  authDomain: import.meta.env?.VITE_FIREBASE_AUTH_DOMAIN || '',
+  projectId: import.meta.env?.VITE_FIREBASE_PROJECT_ID || '',
+  appId: import.meta.env?.VITE_FIREBASE_APP_ID || ''
+};
+const firebaseReady = !!(firebaseConfig.apiKey && firebaseConfig.projectId && firebaseConfig.appId);
+const fbApp = firebaseReady ? initializeApp(firebaseConfig) : null;
+const fbDb = fbApp ? getFirestore(fbApp) : null;
 
 // ==========================================
 // DEFAULT DATA FROM habit.xlsx
@@ -207,7 +215,7 @@ const migrateLogs = (logs, habits) => {
 
 const TREND_DAYS = 30;
 
-function TrackerApp({ onLock }) {
+function TrackerApp({ onLock, password }) {
   // Primary State
   const [activeTab, setActiveTab] = useState('daily');
   const [habits, setHabits] = useState(DEFAULT_HABITS);
@@ -232,12 +240,12 @@ function TrackerApp({ onLock }) {
   const latest = useRef({});
   latest.current = { habits, logs, reviews, settings };
 
-  const [session, setSession] = useState(null);
-  const [syncStatus, setSyncStatus] = useState(supabase ? 'signed-out' : 'not-configured');
+  const [syncStatus, setSyncStatus] = useState(firebaseReady ? 'idle' : 'not-configured');
   const [syncMessage, setSyncMessage] = useState('');
   const [lastSynced, setLastSynced] = useState(null);
-  const [emailInput, setEmailInput] = useState('');
-  const userRef = useRef(null);
+  const keyRef = useRef(null);        // AES key derived from the password
+  const saltRef = useRef(null);       // salt stored with the cloud document
+  const cloudReady = useRef(false);   // true after the first successful sync
   const pushTimer = useRef(null);
 
   const showToast = (msg) => {
@@ -284,9 +292,9 @@ function TrackerApp({ onLock }) {
       showToast('Could not save to browser storage. Use Backup to keep a copy.');
     }
 
-    if (supabase && userRef.current) {
+    if (fbDb && cloudReady.current) {
       clearTimeout(pushTimer.current);
-      pushTimer.current = setTimeout(() => pushToCloud(userRef.current.id, blob), 1500);
+      pushTimer.current = setTimeout(() => pushToCloud(blob), 1500);
     }
   }, [hydrated, habits, logs, reviews, settings]);
 
@@ -296,15 +304,21 @@ function TrackerApp({ onLock }) {
   }, []);
 
   // ----------------------------------------
-  // Cloud sync (Supabase)
+  // Cloud sync (Firestore: one encrypted document at tracker/main)
+  // Data is encrypted in the browser with a key derived from your password,
+  // so the database only ever holds unreadable data.
   // ----------------------------------------
-  const pushToCloud = async (userId, blob) => {
+  const pushToCloud = async (blob) => {
+    if (!fbDb || !keyRef.current) return;
     setSyncStatus('syncing');
     try {
-      const { error } = await supabase
-        .from('habit_state')
-        .upsert({ user_id: userId, data: blob, updated_at: new Date().toISOString() });
-      if (error) throw error;
+      const encrypted = await encryptJSON(keyRef.current, blob);
+      await setDoc(doc(fbDb, 'tracker', 'main'), {
+        salt: saltRef.current,
+        iv: encrypted.iv,
+        ct: encrypted.ct,
+        updatedAt: blob.updatedAt || new Date().toISOString()
+      });
       setSyncStatus('synced');
       setLastSynced(new Date());
     } catch (err) {
@@ -315,73 +329,51 @@ function TrackerApp({ onLock }) {
   };
 
   // Pull the cloud copy if it is newer than this device's copy, otherwise upload this device's copy
-  const syncFromCloud = async (user) => {
-    if (!supabase || !user) return;
+  const syncFromCloud = async () => {
+    if (!fbDb) return;
     setSyncStatus('syncing');
     setSyncMessage('');
     try {
-      const { data: row, error } = await supabase
-        .from('habit_state')
-        .select('data')
-        .eq('user_id', user.id)
-        .maybeSingle();
-      if (error) throw error;
+      const snap = await getDoc(doc(fbDb, 'tracker', 'main'));
 
-      const remote = row?.data;
-      const localStamp = updatedAtRef.current || '';
-      if (remote && (remote.updatedAt || '') > localStamp) {
-        applyData(remote);
-        setSyncMessage('Loaded newer data from the cloud.');
-        setLastSynced(new Date());
-        setSyncStatus('synced');
-      } else {
-        const blob = { ...latest.current, updatedAt: updatedAtRef.current || new Date().toISOString() };
-        updatedAtRef.current = blob.updatedAt;
-        await pushToCloud(user.id, blob);
+      if (!keyRef.current) {
+        // Reuse the salt from the database if there is one, otherwise create a new one
+        const salt = snap.exists() ? snap.data().salt : b64(crypto.getRandomValues(new Uint8Array(16)));
+        saltRef.current = salt;
+        keyRef.current = await deriveKey(password, unb64(salt));
       }
+
+      if (snap.exists()) {
+        const d = snap.data();
+        const remote = await decryptJSON(keyRef.current, d.iv, d.ct);
+        const localStamp = updatedAtRef.current || '';
+        if ((remote.updatedAt || '') > localStamp) {
+          applyData(remote);
+          setSyncMessage('Loaded newer data from the cloud.');
+          setLastSynced(new Date());
+          setSyncStatus('synced');
+          cloudReady.current = true;
+          return;
+        }
+      }
+
+      // This device has the newer copy (or the cloud is empty): upload it
+      const blob = { ...latest.current, updatedAt: updatedAtRef.current || new Date().toISOString() };
+      updatedAtRef.current = blob.updatedAt;
+      await pushToCloud(blob);
+      cloudReady.current = true;
     } catch (err) {
       console.error(err);
       setSyncStatus('error');
-      setSyncMessage(err.message || 'Sync failed');
+      setSyncMessage(err.message || 'Sync failed. Check your Firestore rules and config.');
     }
   };
 
-  // Keep the session in sync with Supabase auth
+  // Sync once after local data has loaded
   useEffect(() => {
-    if (!supabase) return;
-    supabase.auth.getSession().then(({ data }) => setSession(data.session));
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => setSession(s));
-    return () => sub.subscription.unsubscribe();
-  }, []);
-
-  // When signed in (and local data is loaded), sync once
-  useEffect(() => {
-    if (!supabase || !hydrated) return;
-    if (session?.user) {
-      userRef.current = session.user;
-      syncFromCloud(session.user);
-    } else {
-      userRef.current = null;
-      setSyncStatus('signed-out');
-    }
-  }, [session?.user?.id, hydrated]);
-
-  const sendMagicLink = async (e) => {
-    e.preventDefault();
-    const email = emailInput.trim();
-    if (!email) return;
-    const { error } = await supabase.auth.signInWithOtp({
-      email,
-      options: { emailRedirectTo: window.location.origin + window.location.pathname }
-    });
-    if (error) showToast(error.message);
-    else showToast('Check your email for the sign-in link.');
-  };
-
-  const signOut = async () => {
-    await supabase.auth.signOut();
-    showToast('Signed out. Data stays on this device.');
-  };
+    if (!fbDb || !hydrated) return;
+    syncFromCloud();
+  }, [hydrated]);
 
   // ----------------------------------------
   // Derived data
@@ -723,7 +715,7 @@ function TrackerApp({ onLock }) {
 
   const syncLabel = {
     'not-configured': 'Off',
-    'signed-out': 'Signed out',
+    idle: 'Ready',
     syncing: 'Syncing…',
     synced: lastSynced ? `Synced ${lastSynced.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'Synced',
     error: 'Sync error'
@@ -760,7 +752,7 @@ function TrackerApp({ onLock }) {
                   Goal: {settings.targetRate}%
                 </span>
               </div>
-              <p className="text-xs text-slate-400">Offline-first · {session ? 'Synced to cloud' : 'Saved in your browser'}</p>
+              <p className="text-xs text-slate-400">Offline-first · {fbDb ? 'Synced to cloud' : 'Saved in your browser'}</p>
             </div>
           </div>
 
@@ -1558,47 +1550,26 @@ function TrackerApp({ onLock }) {
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <h3 className="text-base font-bold flex items-center gap-2">
-                      {session ? <Cloud className="w-4 h-4 text-emerald-500" /> : <CloudOff className="w-4 h-4 text-slate-400" />}
+                      {fbDb ? <Cloud className="w-4 h-4 text-emerald-500" /> : <CloudOff className="w-4 h-4 text-slate-400" />}
                       Cloud Sync
                     </h3>
-                    <p className="text-xs text-slate-400">Keeps your habits in sync across phone and laptop using Supabase.</p>
+                    <p className="text-xs text-slate-400">Your habits are saved to the database, encrypted with your password.</p>
                   </div>
                   <span className="text-xs px-2.5 py-1 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-500 font-semibold">{syncLabel}</span>
                 </div>
 
                 {syncMessage && <p className="text-xs text-amber-500">{syncMessage}</p>}
 
-                {!supabase ? (
+                {!fbDb ? (
                   <p className="text-xs text-slate-400">
-                    Cloud sync is off. Add <code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code> to a <code>.env</code> file in your project and restart the dev server.
+                    Cloud sync is off. Add the four <code>VITE_FIREBASE_*</code> values to a <code>.env</code> file in your project and restart the dev server.
                   </p>
-                ) : !session ? (
-                  <form onSubmit={sendMagicLink} className="flex flex-col sm:flex-row gap-2">
-                    <label htmlFor="sync-email" className="sr-only">Email address</label>
-                    <input
-                      id="sync-email"
-                      type="email"
-                      required
-                      value={emailInput}
-                      onChange={(e) => setEmailInput(e.target.value)}
-                      placeholder="you@example.com"
-                      className={`flex-1 px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-sm ${FOCUS_RING}`}
-                    />
-                    <button type="submit" className={`px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-semibold ${FOCUS_RING}`}>
-                      Email me a sign-in link
-                    </button>
-                  </form>
                 ) : (
                   <div className="flex flex-wrap items-center justify-between gap-3">
-                    <p className="text-xs text-slate-500">Signed in as <strong>{session.user.email}</strong></p>
-                    <div className="flex gap-2">
-                      <button onClick={() => syncFromCloud(session.user)} className={`flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition ${FOCUS_RING}`}>
-                        <RefreshCw className="w-3.5 h-3.5" /> Sync now
-                      </button>
-                      <button onClick={signOut} className={`flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition ${FOCUS_RING}`}>
-                        <LogOut className="w-3.5 h-3.5" /> Sign out
-                      </button>
-                    </div>
+                    <p className="text-xs text-slate-500">Changes sync automatically. On another device, enter the same password to see your data.</p>
+                    <button onClick={() => syncFromCloud()} className={`flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition ${FOCUS_RING}`}>
+                      <RefreshCw className="w-3.5 h-3.5" /> Sync now
+                    </button>
                   </div>
                 )}
               </div>
@@ -1755,33 +1726,55 @@ function HabitForm({ initial, defaultTarget, onSave, onCancel }) {
 // ==========================================
 // PASSWORD GATE
 // Set VITE_APP_PASSWORD_HASH in .env (SHA-256 hex of your password).
-// The plain password is never stored in the app.
+// The password is also the key that encrypts your cloud data. It is kept in
+// memory only, so you enter it again after each page reload.
 // ==========================================
 const PASSWORD_HASH = (import.meta.env?.VITE_APP_PASSWORD_HASH || '').trim().toLowerCase();
-const UNLOCK_KEY = 'habit_tracker_unlocked';
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
 async function sha256Hex(text) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  const buf = await crypto.subtle.digest('SHA-256', textEncoder.encode(text));
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+const b64 = (bytes) => {
+  const arr = new Uint8Array(bytes);
+  let s = '';
+  for (let i = 0; i < arr.length; i += 0x8000) s += String.fromCharCode(...arr.subarray(i, i + 0x8000));
+  return btoa(s);
+};
+const unb64 = (str) => Uint8Array.from(atob(str), c => c.charCodeAt(0));
+
+// AES-256 key from the password (PBKDF2, 310k iterations)
+async function deriveKey(password, salt) {
+  const base = await crypto.subtle.importKey('raw', textEncoder.encode(password), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: 310000, hash: 'SHA-256' },
+    base,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+async function encryptJSON(key, obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, textEncoder.encode(JSON.stringify(obj)));
+  return { iv: b64(iv), ct: b64(ct) };
+}
+
+async function decryptJSON(key, iv, ct) {
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(iv) }, key, unb64(ct));
+  return JSON.parse(textDecoder.decode(pt));
+}
+
 function PasswordGate() {
-  const [unlocked, setUnlocked] = useState(() => {
-    try {
-      return !!PASSWORD_HASH && sessionStorage.getItem(UNLOCK_KEY) === PASSWORD_HASH;
-    } catch {
-      return false;
-    }
-  });
+  const [password, setPassword] = useState(null); // unlocked password, memory only
   const [pw, setPw] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-
-  const lock = () => {
-    try { sessionStorage.removeItem(UNLOCK_KEY); } catch { /* ignore */ }
-    setPw('');
-    setUnlocked(false);
-  };
 
   const submit = async (e) => {
     e.preventDefault();
@@ -1790,12 +1783,8 @@ function PasswordGate() {
     setError('');
     try {
       const hash = await sha256Hex(pw);
-      if (hash === PASSWORD_HASH) {
-        try { sessionStorage.setItem(UNLOCK_KEY, hash); } catch { /* ignore */ }
-        setUnlocked(true);
-      } else {
-        setError('Wrong password.');
-      }
+      if (hash === PASSWORD_HASH) setPassword(pw);
+      else setError('Wrong password.');
     } catch (err) {
       setError('Could not check the password. Open the app over HTTPS or localhost.');
     } finally {
@@ -1804,7 +1793,9 @@ function PasswordGate() {
     }
   };
 
-  if (unlocked) return <TrackerApp onLock={lock} />;
+  if (password !== null) {
+    return <TrackerApp password={password} onLock={() => setPassword(null)} />;
+  }
 
   if (!PASSWORD_HASH) {
     return (
